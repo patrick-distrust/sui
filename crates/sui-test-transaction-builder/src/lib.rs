@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use move_core_types::ident_str;
+use move_core_types::u256::U256;
 use shared_crypto::intent::{Intent, IntentMessage};
 use std::path::PathBuf;
 use sui_genesis_builder::validator_info::GenesisValidatorMetadata;
@@ -10,7 +11,7 @@ use sui_sdk::rpc_types::{
     SuiObjectDataOptions, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse,
 };
 use sui_sdk::wallet_context::WalletContext;
-use sui_types::SUI_RANDOMNESS_STATE_OBJECT_ID;
+use sui_types::balance::Balance;
 use sui_types::base_types::{FullObjectRef, ObjectID, ObjectRef, SequenceNumber, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, Signature, Signer, get_key_pair};
 use sui_types::digests::TransactionDigest;
@@ -18,14 +19,73 @@ use sui_types::gas_coin::GAS;
 use sui_types::multisig::{BitmapUnit, MultiSig, MultiSigPublicKey};
 use sui_types::multisig_legacy::{MultiSigLegacy, MultiSigPublicKeyLegacy};
 use sui_types::object::Owner;
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::signature::GenericSignature;
 use sui_types::sui_system_state::SUI_SYSTEM_MODULE_NAME;
 use sui_types::transaction::{
-    CallArg, DEFAULT_VALIDATOR_GAS_PRICE, ObjectArg, ProgrammableTransaction,
-    SharedObjectMutability, TEST_ONLY_GAS_UNIT_FOR_HEAVY_COMPUTATION_STORAGE,
-    TEST_ONLY_GAS_UNIT_FOR_TRANSFER, Transaction, TransactionData,
+    Argument, CallArg, DEFAULT_VALIDATOR_GAS_PRICE, FundsWithdrawalArg, ObjectArg,
+    ProgrammableTransaction, SharedObjectMutability,
+    TEST_ONLY_GAS_UNIT_FOR_HEAVY_COMPUTATION_STORAGE, TEST_ONLY_GAS_UNIT_FOR_TRANSFER, Transaction,
+    TransactionData,
 };
+use sui_types::{Identifier, SUI_FRAMEWORK_PACKAGE_ID, SUI_RANDOMNESS_STATE_OBJECT_ID};
 use sui_types::{SUI_SYSTEM_PACKAGE_ID, TypeTag};
+
+#[derive(Clone)]
+pub enum FundSource {
+    Coin(ObjectRef),
+    AddressFund {
+        /// If None, it will be set the same as the total transfer amount.
+        reservation: Option<u64>,
+    },
+    ObjectFund {
+        /// The ID of the object_balance package from examples.
+        /// We need this package to test object balance withdrawals.
+        package_id: ObjectID,
+        /// The object to withdraw funds from.
+        withdraw_object: ObjectFundObject,
+    },
+}
+
+#[derive(Clone)]
+pub enum ObjectFundObject {
+    Owned(ObjectRef),
+    Shared(ObjectID, SequenceNumber /* init shared version */),
+}
+
+impl FundSource {
+    pub fn coin(coin: ObjectRef) -> Self {
+        Self::Coin(coin)
+    }
+
+    pub fn address_fund() -> Self {
+        Self::AddressFund { reservation: None }
+    }
+
+    pub fn address_fund_with_reservation(reservation: u64) -> Self {
+        Self::AddressFund {
+            reservation: Some(reservation),
+        }
+    }
+
+    pub fn object_fund_owned(package_id: ObjectID, withdraw_object: ObjectRef) -> Self {
+        Self::ObjectFund {
+            package_id,
+            withdraw_object: ObjectFundObject::Owned(withdraw_object),
+        }
+    }
+
+    pub fn object_fund_shared(
+        package_id: ObjectID,
+        withdraw_object_id: ObjectID,
+        initial_shared_version: SequenceNumber,
+    ) -> Self {
+        Self::ObjectFund {
+            package_id,
+            withdraw_object: ObjectFundObject::Shared(withdraw_object_id, initial_shared_version),
+        }
+    }
+}
 
 pub struct TestTransactionBuilder {
     test_data: TestTransactionData,
@@ -295,27 +355,31 @@ impl TestTransactionBuilder {
         self
     }
 
-    pub fn transfer_sui_to_address_balance(mut self, amount: u64, recipient: SuiAddress) -> Self {
+    pub fn transfer_sui_to_address_balance(
+        mut self,
+        source: FundSource,
+        amounts_and_recipients: Vec<(u64, SuiAddress)>,
+    ) -> Self {
         self.test_data =
             TestTransactionData::TransferFundsToAddressBalance(TransferFundsToAddressBalanceData {
-                amount,
+                source,
+                amounts_and_recipients,
                 type_arg: GAS::type_tag(),
-                recipient,
             });
         self
     }
 
     pub fn transfer_funds_to_address_balance(
         mut self,
-        amount: u64,
+        source: FundSource,
+        amounts_and_recipients: Vec<(u64, SuiAddress)>,
         type_arg: TypeTag,
-        recipient: SuiAddress,
     ) -> Self {
         self.test_data =
             TestTransactionData::TransferFundsToAddressBalance(TransferFundsToAddressBalanceData {
-                amount,
+                source,
+                amounts_and_recipients,
                 type_arg,
-                recipient,
             });
         self
     }
@@ -395,17 +459,119 @@ impl TestTransactionBuilder {
                 self.gas_price,
             ),
             TestTransactionData::TransferFundsToAddressBalance(data) => {
-                TransactionData::new_transfer_funds_to_address_balance(
-                    data.recipient,
+                fn send_funds(
+                    builder: &mut ProgrammableTransactionBuilder,
+                    balance: Argument,
+                    recipient: SuiAddress,
+                    type_arg: TypeTag,
+                ) {
+                    let recipient_arg = builder.pure(recipient).unwrap();
+                    builder.programmable_move_call(
+                        SUI_FRAMEWORK_PACKAGE_ID,
+                        Identifier::new("balance").unwrap(),
+                        Identifier::new("send_funds").unwrap(),
+                        vec![type_arg],
+                        vec![balance, recipient_arg],
+                    );
+                }
+                let mut builder = ProgrammableTransactionBuilder::new();
+                let total_amount = data
+                    .amounts_and_recipients
+                    .iter()
+                    .map(|(amount, _)| *amount)
+                    .sum::<u64>();
+                match data.source {
+                    FundSource::Coin(coin) => {
+                        let source = if coin == self.gas_object {
+                            Argument::GasCoin
+                        } else {
+                            builder.obj(ObjectArg::ImmOrOwnedObject(coin)).unwrap()
+                        };
+                        for (amount, recipient) in data.amounts_and_recipients {
+                            let amount_arg = builder.pure(amount).unwrap();
+                            let coin = builder.programmable_move_call(
+                                SUI_FRAMEWORK_PACKAGE_ID,
+                                Identifier::new("coin").unwrap(),
+                                Identifier::new("split").unwrap(),
+                                vec![data.type_arg.clone()],
+                                vec![source, amount_arg],
+                            );
+                            let balance = builder.programmable_move_call(
+                                SUI_FRAMEWORK_PACKAGE_ID,
+                                Identifier::new("coin").unwrap(),
+                                Identifier::new("into_balance").unwrap(),
+                                vec![data.type_arg.clone()],
+                                vec![coin],
+                            );
+                            send_funds(&mut builder, balance, recipient, data.type_arg.clone());
+                        }
+                    }
+                    FundSource::AddressFund { reservation } => {
+                        let reservation = reservation.unwrap_or(total_amount);
+                        let source = builder
+                            .funds_withdrawal(FundsWithdrawalArg::balance_from_sender(
+                                reservation,
+                                data.type_arg.clone().into(),
+                            ))
+                            .unwrap();
+                        for (amount, recipient) in data.amounts_and_recipients {
+                            let amount_arg = builder.pure(U256::from(amount)).unwrap();
+                            let split = builder.programmable_move_call(
+                                SUI_FRAMEWORK_PACKAGE_ID,
+                                Identifier::new("funds_accumulator").unwrap(),
+                                Identifier::new("withdrawal_split").unwrap(),
+                                vec![Balance::type_tag(data.type_arg.clone())],
+                                vec![source, amount_arg],
+                            );
+                            let balance = builder.programmable_move_call(
+                                SUI_FRAMEWORK_PACKAGE_ID,
+                                Identifier::new("balance").unwrap(),
+                                Identifier::new("redeem_funds").unwrap(),
+                                vec![data.type_arg.clone()],
+                                vec![split],
+                            );
+                            send_funds(&mut builder, balance, recipient, data.type_arg.clone());
+                        }
+                    }
+                    FundSource::ObjectFund {
+                        package_id,
+                        withdraw_object,
+                    } => {
+                        let source = match withdraw_object {
+                            ObjectFundObject::Owned(object) => {
+                                builder.obj(ObjectArg::ImmOrOwnedObject(object)).unwrap()
+                            }
+                            ObjectFundObject::Shared(object_id, initial_shared_version) => builder
+                                .obj(ObjectArg::SharedObject {
+                                    id: object_id,
+                                    initial_shared_version,
+                                    mutability: SharedObjectMutability::Mutable,
+                                })
+                                .unwrap(),
+                        };
+                        for (amount, recipient) in data.amounts_and_recipients {
+                            let amount_arg = builder.pure(amount).unwrap();
+                            let balance = builder.programmable_move_call(
+                                package_id,
+                                Identifier::new("object_balance").unwrap(),
+                                Identifier::new("withdraw_funds").unwrap(),
+                                vec![data.type_arg.clone()],
+                                vec![source, amount_arg],
+                            );
+                            send_funds(&mut builder, balance, recipient, data.type_arg.clone());
+                        }
+                    }
+                }
+                let pt = builder.finish();
+                TransactionData::new_programmable(
                     self.sender,
-                    data.amount,
-                    data.type_arg,
-                    self.gas_object,
-                    self.gas_budget
-                        .unwrap_or(self.gas_price * TEST_ONLY_GAS_UNIT_FOR_TRANSFER),
+                    vec![self.gas_object],
+                    pt,
+                    self.gas_budget.unwrap_or(
+                        self.gas_price * TEST_ONLY_GAS_UNIT_FOR_HEAVY_COMPUTATION_STORAGE,
+                    ),
                     self.gas_price,
                 )
-                .unwrap()
             }
             TestTransactionData::SplitCoin(data) => TransactionData::new_split_coin(
                 self.sender,
@@ -548,9 +714,9 @@ struct TransferSuiData {
 }
 
 struct TransferFundsToAddressBalanceData {
-    amount: u64,
+    source: FundSource,
+    amounts_and_recipients: Vec<(u64, SuiAddress)>,
     type_arg: TypeTag,
-    recipient: SuiAddress,
 }
 
 struct SplitCoinData {

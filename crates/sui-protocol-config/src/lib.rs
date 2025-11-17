@@ -2397,6 +2397,10 @@ impl ProtocolConfig {
     pub fn deprecate_global_storage_ops(&self) -> bool {
         self.feature_flags.deprecate_global_storage_ops
     }
+
+    pub fn enable_object_funds_withdraw(&self) -> bool {
+        self.feature_flags.enable_object_funds_withdraw
+    }
 }
 
 #[cfg(not(msim))]
@@ -4193,7 +4197,7 @@ impl ProtocolConfig {
                 95 => {
                     cfg.type_name_id_base_cost = Some(52);
 
-                    // Reudce the frequency of checkpoint splitting under high TPS.
+                    // Reduce the frequency of checkpoint splitting under high TPS.
                     cfg.max_transactions_per_checkpoint = Some(20_000);
                 }
                 96 => {
