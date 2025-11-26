@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::abi::EthBridgeEvent;
 use crate::error::{BridgeError, BridgeResult};
-use crate::metered_eth_provider::{MeteredEthHttpProvier, new_metered_eth_provider};
+use crate::metered_eth_provider::{MeteredEthHttpProvider, new_metered_eth_provider};
 use crate::metrics::BridgeMetrics;
 use crate::types::{BridgeAction, EthLog, RawEthLog};
 use ethers::providers::{JsonRpcClient, Middleware, Provider};

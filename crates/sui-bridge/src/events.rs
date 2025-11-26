@@ -12,7 +12,6 @@ use crate::crypto::BridgeAuthorityPublicKey;
 use crate::error::BridgeError;
 use crate::error::BridgeResult;
 use crate::types::BridgeAction;
-use crate::types::SuiToEthBridgeAction;
 use crate::types::SuiToEthTokenTransfer;
 use crate::types::SuiToEthTokenTransferV2;
 use ethers::types::Address as EthAddress;

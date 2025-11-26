@@ -316,6 +316,7 @@ where
             EthBridgeEvent::EthSuiBridgeEvents(event) => match event {
                 EthSuiBridgeEvents::TokensClaimedFilter(_) => (),
                 EthSuiBridgeEvents::TokensDepositedFilter(_) => (),
+                EthSuiBridgeEvents::TokensDepositedV2Filter(_) => (),
                 EthSuiBridgeEvents::PausedFilter(_) => bump_eth_counter!("bridge_paused"),
                 EthSuiBridgeEvents::UnpausedFilter(_) => bump_eth_counter!("bridge_unpaused"),
                 EthSuiBridgeEvents::UpgradedFilter(_) => {

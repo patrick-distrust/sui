@@ -647,13 +647,20 @@ public fun required_voting_power(self: &BridgeMessage): u64 {
 // Convert BridgeMessage to ParsedTokenTransferMessage
 public fun to_parsed_token_transfer_message(message: &BridgeMessage): ParsedTokenTransferMessage {
     assert!(message.message_type() == message_types::token(), EMustBeTokenMessage);
-    let payload = message.extract_token_bridge_payload();
+    // Handle both V1 and V2 message formats
+    let parsed_payload = if (message.message_version() == 2) {
+        // V2 payload has timestamp - extract and convert to V1 format
+        message.extract_token_bridge_payload_v2().to_token_payload_v1()
+    } else {
+        // V1 payload
+        message.extract_token_bridge_payload()
+    };
     ParsedTokenTransferMessage {
         message_version: message.message_version(),
         seq_num: message.seq_num(),
         source_chain: message.source_chain(),
         payload: message.payload(),
-        parsed_payload: payload,
+        parsed_payload,
     }
 }
 

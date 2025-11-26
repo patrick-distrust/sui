@@ -7,14 +7,15 @@ use crate::encoding::{
 };
 use crate::encoding::{
     COMMITTEE_BLOCKLIST_MESSAGE_VERSION, EMERGENCY_BUTTON_MESSAGE_VERSION,
-    TOKEN_TRANSFER_MESSAGE_VERSION_V1,
+    TOKEN_TRANSFER_MESSAGE_VERSION_V1, TOKEN_TRANSFER_MESSAGE_VERSION_V2,
 };
 use crate::error::{BridgeError, BridgeResult};
 use crate::types::ParsedTokenTransferMessage;
 use crate::types::{
     AddTokensOnEvmAction, AssetPriceUpdateAction, BlocklistCommitteeAction, BridgeAction,
-    BridgeActionType, EmergencyAction, EthLog, EthToSuiBridgeAction, EvmContractUpgradeAction,
-    LimitUpdateAction, SuiToEthBridgeAction, SuiToEthTokenTransfer,
+    BridgeActionType, EmergencyAction, EthLog, EthToSuiBridgeAction, EthToSuiTokenTransferV2,
+    EvmContractUpgradeAction, LimitUpdateAction, SuiToEthBridgeAction, SuiToEthTokenTransfer,
+    SuiToEthTokenTransferV2,
 };
 use ethers::types::Log;
 use ethers::{
@@ -79,7 +80,7 @@ macro_rules! gen_eth_events {
 
 #[rustfmt::skip]
 gen_eth_events!(
-    EthSuiBridge, EthSuiBridgeEvents, "abi/sui_bridge.json",
+    EthSuiBridge, EthSuiBridgeEvents, "abi/sui_bridge_v2.json",
     EthBridgeCommittee, EthBridgeCommitteeEvents, "abi/bridge_committee.json",
     EthBridgeLimiter, EthBridgeLimiterEvents, "abi/bridge_limiter.json",
     EthBridgeConfig, EthBridgeConfigEvents, "abi/bridge_config.json",
@@ -132,6 +133,19 @@ impl EthBridgeEvent {
                             eth_event_index,
                             eth_bridge_event: bridge_event,
                         }))
+                    }
+                    EthSuiBridgeEvents::TokensDepositedV2Filter(event) => {
+                        let bridge_event = EthToSuiTokenBridgeV2::try_from(&event)?;
+                        let timestamp_ms = bridge_event.timestamp_ms;
+                        let eth_bridge_event: EthToSuiTokenBridgeV1 = bridge_event.into();
+                        Some(BridgeAction::EthToSuiTokenTransferV2(
+                            EthToSuiTokenTransferV2 {
+                                eth_tx_hash,
+                                eth_event_index,
+                                eth_bridge_event,
+                                timestamp_ms,
+                            },
+                        ))
                     }
                     EthSuiBridgeEvents::TokensClaimedFilter(_event) => None,
                     EthSuiBridgeEvents::PausedFilter(_event) => None,
@@ -203,6 +217,50 @@ impl TryFrom<&TokensDepositedFilter> for EthToSuiTokenBridgeV1 {
     }
 }
 
+/// Sanity checked version of TokensDepositedV2Filter that captures the new timestamp.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
+pub struct EthToSuiTokenBridgeV2 {
+    pub nonce: u64,
+    pub sui_chain_id: BridgeChainId,
+    pub eth_chain_id: BridgeChainId,
+    pub sui_address: SuiAddress,
+    pub eth_address: EthAddress,
+    pub token_id: u8,
+    pub sui_adjusted_amount: u64,
+    pub timestamp_ms: u64,
+}
+
+impl TryFrom<&TokensDepositedV2Filter> for EthToSuiTokenBridgeV2 {
+    type Error = BridgeError;
+
+    fn try_from(event: &TokensDepositedV2Filter) -> BridgeResult<Self> {
+        Ok(Self {
+            nonce: event.nonce,
+            sui_chain_id: BridgeChainId::try_from(event.destination_chain_id)?,
+            eth_chain_id: BridgeChainId::try_from(event.source_chain_id)?,
+            sui_address: SuiAddress::from_bytes(event.recipient_address.as_ref())?,
+            eth_address: event.sender_address,
+            token_id: event.token_id,
+            sui_adjusted_amount: event.sui_adjusted_amount,
+            timestamp_ms: event.timestamp_ms.as_u64(),
+        })
+    }
+}
+
+impl From<EthToSuiTokenBridgeV2> for EthToSuiTokenBridgeV1 {
+    fn from(value: EthToSuiTokenBridgeV2) -> Self {
+        Self {
+            nonce: value.nonce,
+            sui_chain_id: value.sui_chain_id,
+            eth_chain_id: value.eth_chain_id,
+            sui_address: value.sui_address,
+            eth_address: value.eth_address,
+            token_id: value.token_id,
+            sui_adjusted_amount: value.sui_adjusted_amount,
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////
 //                        Eth Message Conversion                      //
 ////////////////////////////////////////////////////////////////////////
@@ -235,7 +293,24 @@ impl TryFrom<SuiToEthTokenTransfer> for eth_sui_bridge::Message {
     fn try_from(action: SuiToEthTokenTransfer) -> BridgeResult<Self> {
         Ok(eth_sui_bridge::Message {
             message_type: BridgeActionType::TokenTransfer as u8,
-            version: TOKEN_TRANSFER_MESSAGE_VERSION,
+            version: TOKEN_TRANSFER_MESSAGE_VERSION_V1,
+            nonce: action.nonce,
+            chain_id: action.sui_chain_id as u8,
+            payload: action
+                .as_payload_bytes()
+                .map_err(|e| BridgeError::Generic(format!("Failed to encode payload: {}", e)))?
+                .into(),
+        })
+    }
+}
+
+impl TryFrom<SuiToEthTokenTransferV2> for eth_sui_bridge::Message {
+    type Error = BridgeError;
+
+    fn try_from(action: SuiToEthTokenTransferV2) -> BridgeResult<Self> {
+        Ok(eth_sui_bridge::Message {
+            message_type: BridgeActionType::TokenTransfer as u8,
+            version: TOKEN_TRANSFER_MESSAGE_VERSION_V2,
             nonce: action.nonce,
             chain_id: action.sui_chain_id as u8,
             payload: action
@@ -596,10 +671,11 @@ mod tests {
                 ),
             },
         ));
-        assert!(e
-            .try_into_bridge_action(TxHash::random(), 0)
-            .unwrap()
-            .is_some());
+        assert!(
+            e.try_into_bridge_action(TxHash::random(), 0)
+                .unwrap()
+                .is_some()
+        );
 
         let e = EthBridgeEvent::EthSuiBridgeEvents(EthSuiBridgeEvents::TokensDepositedFilter(
             TokensDepositedFilter {
@@ -614,10 +690,7 @@ mod tests {
                 ),
             },
         ));
-        match e
-            .try_into_bridge_action(TxHash::random(), 0)
-            .unwrap_err()
-        {
+        match e.try_into_bridge_action(TxHash::random(), 0).unwrap_err() {
             BridgeError::ZeroValueBridgeTransfer(_) => {}
             e => panic!("Unexpected error: {:?}", e),
         }

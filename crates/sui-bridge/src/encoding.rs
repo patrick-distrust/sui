@@ -228,7 +228,7 @@ impl BridgeMessageEncoding for EthToSuiTokenTransferV2 {
         // Add message type
         bytes.push(BridgeActionType::TokenTransfer as u8);
         // Add message version
-        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V1);
+        bytes.push(TOKEN_TRANSFER_MESSAGE_VERSION_V2);
         // Add nonce
         bytes.extend_from_slice(&e.nonce.to_be_bytes());
         // Add source chain id

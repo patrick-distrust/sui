@@ -29,7 +29,7 @@ use sui::vec_map::{Self, VecMap};
 use sui::versioned::{Self, Versioned};
 use sui_system::sui_system::SuiSystemState;
 
-const MESSAGE_VERSION: u8 = 1;
+const MESSAGE_VERSION: u8 = 2;
 
 // Transfer Status
 const TRANSFER_STATUS_PENDING: u8 = 0;
@@ -345,8 +345,12 @@ public fun approve_token_transfer(
     inner.committee.verify_signatures(message, signatures);
 
     assert!(message.message_type() == message_types::token(), EMustBeTokenMessage);
-    assert!(message.message_version() == MESSAGE_VERSION, EUnexpectedMessageVersion);
-    let token_payload = message.extract_token_bridge_payload();
+    assert!(message.message_version() <= MESSAGE_VERSION, EUnexpectedMessageVersion);
+    let token_payload = if (message.message_version() == 2) {
+        message.extract_token_bridge_payload_v2().to_token_payload_v1()
+    } else {
+        message.extract_token_bridge_payload()
+    };
     let target_chain = token_payload.token_target_chain();
     assert!(
         message.source_chain() == inner.chain_id || target_chain == inner.chain_id,
@@ -441,7 +445,7 @@ public fun execute_system_message(
     let message_type = message.message_type();
 
     // TODO: test version mismatch
-    assert!(message.message_version() == MESSAGE_VERSION, EUnexpectedMessageVersion);
+    assert!(message.message_version() <= MESSAGE_VERSION, EUnexpectedMessageVersion);
     let inner = load_inner_mut(bridge);
 
     assert!(message.source_chain() == inner.chain_id, EUnexpectedChainID);
@@ -570,16 +574,16 @@ fun claim_token_internal<T>(
 
     // extract token message
     let mut bypass_limiter = false;
-    let mut token_payload;
-    if (record.message.message_version() == 1) {
-        token_payload = record.message.extract_token_bridge_payload();
-    } else if (record.message.message_version() == 2) {
+    let token_payload;
+    if (record.message.message_version() == 2) {
         let token_payload_v2 = record.message.extract_token_bridge_payload_v2();
 
         let timestamp = token_payload_v2.timestamp_ms();
         // if token_payload.timestamp is within the last 48 hours, bypass the limiter
         bypass_limiter = clock.timestamp_ms() < timestamp + 48 * 3600000;
         token_payload = token_payload_v2.to_token_payload_v1();
+    } else {
+        token_payload = record.message.extract_token_bridge_payload();
     };
 
     // get owner address

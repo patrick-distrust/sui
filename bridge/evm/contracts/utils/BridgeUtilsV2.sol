@@ -53,7 +53,7 @@ library BridgeUtilsV2 {
         pure
         returns (TokenTransferPayloadV2 memory)
     {
-        require(_payload.length == 71, "BridgeUtils: TokenTransferPayload must be 71 bytes");
+        require(_payload.length == 72, "BridgeUtils: TokenTransferPayload must be 72 bytes");
 
         uint8 senderAddressLength = uint8(_payload[0]);
 
@@ -117,11 +117,14 @@ library BridgeUtilsV2 {
             amount := mload(add(_payload, add(amountLength, offset)))
         }
 
-        uint256 message_timestamp;
         // Extract timestamp from payload bytes 64-71
+        // Similar to amount extraction: offset 72 = 32 (length prefix) + 40 (data position)
+        // reads bytes 40-71, casting to uint64 keeps low 8 bytes (64-71)
+        uint64 timestamp64;
         assembly {
-            message_timestamp := mload(add(_payload, 64))
+            timestamp64 := mload(add(_payload, 72))
         }
+        uint256 message_timestamp = uint256(timestamp64);
 
         return TokenTransferPayloadV2(
             senderAddressLength,
